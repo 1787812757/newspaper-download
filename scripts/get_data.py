@@ -71,43 +71,98 @@ _ALIASES: Dict[str, List[str]] = {
 
 # ─────────────────────── HTTP 层 ───────────────────────
 
-_SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE
+def _build_ssl_contexts() -> List[ssl.SSLContext]:
+    """构建多个 SSL 上下文，按宽松度递增排列，用于自动 fallback."""
+    ctxs: List[ssl.SSLContext] = []
+    # 策略 1: 默认上下文 + 关闭证书校验
+    try:
+        c1 = ssl.create_default_context()
+        c1.check_hostname = False
+        c1.verify_mode = ssl.CERT_NONE
+        ctxs.append(c1)
+    except Exception:
+        pass
+    # 策略 2: 完全不验证的上下文（兼容旧 OpenSSL）
+    try:
+        c2 = ssl._create_unverified_context()  # noqa: SLF001
+        ctxs.append(c2)
+    except Exception:
+        pass
+    if not ctxs:
+        ctxs.append(ssl.create_default_context())
+    return ctxs
+
+
+def _build_opener() -> urllib_request.OpenerDirector:
+    """构建绕过系统代理的 urllib opener.
+
+    许多运行环境（Windows 系统代理、企业代理、AI 平台沙箱）的 HTTPS 代理
+    与目标服务器 TLS 不兼容，导致 'EOF occurred in violation of protocol'。
+    显式使用空 ProxyHandler 绕过所有代理，直连目标服务器。
+    """
+    return urllib_request.build_opener(
+        urllib_request.ProxyHandler({}),
+        urllib_request.HTTPSHandler(context=_build_ssl_contexts()[0]),
+    )
+
+_SSL_CONTEXTS = _build_ssl_contexts()
+_OPENER = _build_opener()
+_MAX_RETRIES = 2
 
 
 def _http_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """对 OCR API 发起 GET 请求并返回解析后的 JSON."""
+    """对 OCR API 发起 GET 请求并返回解析后的 JSON.
+
+    使用无代理 opener + 多 SSL 上下文自动 fallback + 重试。
+    """
     url = f"{OCR_API_BASE.rstrip('/')}{path}"
     if params:
         qs = "&".join(f"{k}={urllib_request.quote(str(v))}" for k, v in params.items() if v is not None)
         if qs:
             url = f"{url}?{qs}"
 
-    req = urllib_request.Request(url, method="GET", headers={"Accept": "application/json"})
-    try:
-        with urllib_request.urlopen(req, timeout=TIMEOUT_SECONDS, context=_SSL_CTX) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-    except urllib_error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        error_code, message = "unknown", err_body[:300]
-        try:
-            err_json = json.loads(err_body)
-            if isinstance(err_json.get("detail"), dict):
-                d = err_json["detail"]
-                error_code = d.get("error_code", "unknown")
-                message = d.get("message", message)
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-        raise RuntimeError(f"OCR API {path} [{error_code}] {exc.code}: {message}") from exc
-    except urllib_error.URLError as exc:
-        raise RuntimeError(f"OCR API {path} failed: {exc.reason}") from exc
+    req = urllib_request.Request(url, method="GET", headers={
+        "Accept": "application/json",
+        "User-Agent": "SkillBot/2.0",
+        "Connection": "close",
+    })
+    last_exc: Optional[Exception] = None
 
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"OCR API {path} returned invalid JSON") from exc
-    return parsed if isinstance(parsed, dict) else {"data": parsed}
+    for ctx in _SSL_CONTEXTS:
+        opener = urllib_request.build_opener(
+            urllib_request.ProxyHandler({}),
+            urllib_request.HTTPSHandler(context=ctx),
+        )
+        for attempt in range(_MAX_RETRIES):
+            try:
+                with opener.open(req, timeout=TIMEOUT_SECONDS) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(f"OCR API {path} returned invalid JSON") from exc
+                return parsed if isinstance(parsed, dict) else {"data": parsed}
+            except urllib_error.HTTPError as exc:
+                err_body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+                error_code, message = "unknown", err_body[:300]
+                try:
+                    err_json = json.loads(err_body)
+                    if isinstance(err_json.get("detail"), dict):
+                        d = err_json["detail"]
+                        error_code = d.get("error_code", "unknown")
+                        message = d.get("message", message)
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+                raise RuntimeError(f"OCR API {path} [{error_code}] {exc.code}: {message}") from exc
+            except (urllib_error.URLError, ssl.SSLError, OSError, EOFError) as exc:
+                last_exc = exc
+                continue
+
+    reason = str(last_exc) if last_exc else "unknown network error"
+    raise RuntimeError(
+        f"OCR API {path} failed after trying {len(_SSL_CONTEXTS)} SSL strategies: {reason}. "
+        f"请检查网络连接或 Python/OpenSSL 版本（建议 Python>=3.8, OpenSSL>=1.1.1）。"
+    )
 
 # ─────────────────────── OCR API 封装 ───────────────────────
 
